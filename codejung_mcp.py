@@ -121,12 +121,17 @@ def _unstage(host_sub: str) -> None:
 def _sweep_stale_staging(max_age_min: int = 360) -> None:
     """Best-effort removal of staging dirs orphaned by timed-out jobs. The age
     threshold is deliberately generous (default 6h) so an in-flight review is
-    never swept out from under a running job. Failures are ignored."""
+    never swept out from under a running job. Failures are ignored.
+
+    Only dirs whose names match our own stage-id shape (12 hex chars) are
+    removed, so even a misconfigured STAGING_HOST_DIR cannot delete unrelated
+    directories."""
+    hex12 = "[0-9a-f]" * 12  # matches uuid4().hex[:12] created by _stage_dir
     try:
         subprocess.run(
             ["ssh", "-o", "BatchMode=yes", SSH_HOST,
              f"find {STAGING_HOST_DIR} -mindepth 1 -maxdepth 1 -type d "
-             f"-mmin +{max_age_min} -exec rm -rf {{}} + 2>/dev/null || true"],
+             f"-name '{hex12}' -mmin +{max_age_min} -exec rm -rf {{}} + 2>/dev/null || true"],
             capture_output=True, text=True, timeout=30,
         )
     except Exception:
