@@ -38,10 +38,11 @@ _JOB_ID_RE = re.compile(r"^cj_[0-9a-f]+$")
 
 def _safe_config_path(value: str, name: str) -> str:
     """Operator-supplied paths are interpolated into a remote shell command (and
-    must stay unquoted so a leading ~ expands). Reject shell metacharacters and
-    whitespace so interpolation cannot inject commands."""
-    if re.search(r"""[\s;&|`$(){}<>*?!\\"']""", value):
-        raise ValueError(f"{name} contains unsafe characters: {value!r}")
+    must stay unquoted so a leading ~ expands). Allow-list path-safe characters
+    only — this rejects globs ([ ]), comments (#), quotes, whitespace, and every
+    command/redirection metacharacter, so interpolation cannot inject commands."""
+    if not re.fullmatch(r"[A-Za-z0-9._/~-]+", value):
+        raise ValueError(f"{name} has non-path characters: {value!r}")
     return value
 
 
@@ -233,12 +234,20 @@ def review_dir(path: str, timeout_mins: int = 30) -> dict:
     """
     _sweep_stale_staging()  # reap staging dirs orphaned by earlier timed-out jobs
     container_path, host_sub = _stage_dir(path)
+
+    # Submit first, in its own guard, so job_id is unambiguously bound before the
+    # polling loop and the timeout return below.
+    try:
+        job_id = _submit_local_dir(container_path)
+    except Exception:
+        _unstage(host_sub)
+        raise
+
     # NOTE: cleanup is deliberately NOT in a `finally`. The worker reads the
     # staged files *during* the review, so unstaging on a client-side wait
     # timeout would pull the rug out from under a still-running job. We only
     # unstage once the job reaches a terminal state (or on an error path).
     try:
-        job_id = _submit_local_dir(container_path)
         deadline = time.monotonic() + timeout_mins * 60
         while time.monotonic() < deadline:
             job = _poll(job_id)
