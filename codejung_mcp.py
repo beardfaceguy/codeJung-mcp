@@ -117,6 +117,21 @@ def _unstage(host_sub: str) -> None:
                    capture_output=True, text=True, timeout=30)
 
 
+def _sweep_stale_staging(max_age_min: int = 360) -> None:
+    """Best-effort removal of staging dirs orphaned by timed-out jobs. The age
+    threshold is deliberately generous (default 6h) so an in-flight review is
+    never swept out from under a running job. Failures are ignored."""
+    try:
+        subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", SSH_HOST,
+             f"find {STAGING_HOST_DIR} -mindepth 1 -maxdepth 1 -type d "
+             f"-mmin +{max_age_min} -exec rm -rf {{}} + 2>/dev/null || true"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        pass
+
+
 def _poll(job_id: str) -> dict:
     if not _JOB_ID_RE.match(job_id):
         raise ValueError(f"invalid job id: {job_id!r}")
@@ -216,6 +231,7 @@ def review_dir(path: str, timeout_mins: int = 30) -> dict:
         {"jobId","status","summaryMarkdown","findings"} on success, or
         {"jobId"/None,"status","error"} on failure/timeout.
     """
+    _sweep_stale_staging()  # reap staging dirs orphaned by earlier timed-out jobs
     container_path, host_sub = _stage_dir(path)
     # NOTE: cleanup is deliberately NOT in a `finally`. The worker reads the
     # staged files *during* the review, so unstaging on a client-side wait
@@ -243,11 +259,10 @@ def review_dir(path: str, timeout_mins: int = 30) -> dict:
         raise
     # Client-side wait elapsed but the job is still running and still needs the
     # staged files — leave them in place; the job (and get_review) can finish.
+    # The staged copy is reaped by _sweep_stale_staging() on a later run.
     return {"jobId": job_id, "status": "timed_out",
-            "error": (f"still running after {timeout_mins} min; poll "
-                      f"get_review('{job_id}'). Staged copy left at {host_sub} "
-                      f"on the host until the job completes."),
-            "stagedHostDir": host_sub}
+            "error": (f"still running after {timeout_mins} min; "
+                      f"poll get_review('{job_id}').")}
 
 
 if __name__ == "__main__":
