@@ -6,9 +6,17 @@ its host (the `codejung` Raspberry Pi), so every call is executed on the host
 via SSH — the service token is read there and never leaves that machine, exactly
 mirroring cj-review-remote.sh.
 
+Two backends, chosen by config:
+  * Remote — set CODEJUNG_API_URL to talk to the public REST API over HTTPS.
+  * SSH    — default; runs curl against the loopback API on the host over SSH,
+             so the token never leaves that machine.
+
 Config (env vars):
-  CODEJUNG_SSH_HOST   SSH host running the service   (default: codejung)
-  CODEJUNG_ENV_PATH   path to codejung.env on host   (default: ~/codeJung/deploy/codejung.env)
+  CODEJUNG_API_URL    remote REST base, e.g. https://codejung.wint3rmute.com
+                      (setting this switches the server into remote mode)
+  CODEJUNG_API_TOKEN  bearer token for the remote API (required in remote mode)
+  CODEJUNG_SSH_HOST   SSH host running the service   (default: codejung; SSH mode)
+  CODEJUNG_ENV_PATH   path to codejung.env on host   (default: ~/codeJung/deploy/codejung.env; SSH mode)
 """
 from __future__ import annotations
 
@@ -18,9 +26,18 @@ import re
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 import uuid
 
 from mcp.server.fastmcp import FastMCP
+
+# Remote mode: when CODEJUNG_API_URL is set, talk to the public REST API over
+# HTTPS with CODEJUNG_API_TOKEN. When unset, fall back to SSH-to-loopback below.
+REMOTE_URL = os.environ.get("CODEJUNG_API_URL", "").rstrip("/")
+REMOTE_TOKEN = os.environ.get("CODEJUNG_API_TOKEN", "")
+if REMOTE_URL and not REMOTE_TOKEN:
+    raise SystemExit("CODEJUNG_API_URL is set but CODEJUNG_API_TOKEN is missing")
 
 SSH_HOST = os.environ.get("CODEJUNG_SSH_HOST", "codejung")
 ENV_PATH = os.environ.get("CODEJUNG_ENV_PATH", "~/codeJung/deploy/codejung.env")
@@ -53,40 +70,57 @@ STAGING_HOST_DIR = _safe_config_path(STAGING_HOST_DIR, "CODEJUNG_REVIEW_STAGING"
 mcp = FastMCP("codejung")
 
 
-def _remote(curl_cmd: str) -> str:
-    """Run a curl against the loopback API on the host; token stays on the host."""
-    # cut -f2- (not -f2): tokens may legitimately contain '=' characters.
-    token_expr = f"TOKEN=$(grep ^CODEJUNG_SERVICE_API_TOKEN {ENV_PATH} | cut -d= -f2-)"
+def _ssh(remote_cmd: str) -> str:
+    """Run a command on the codeJung host over SSH; return stdout."""
     proc = subprocess.run(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", SSH_HOST,
-         f"{token_expr}; {curl_cmd}"],
+        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", SSH_HOST, remote_cmd],
         capture_output=True, text=True, timeout=60,
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"ssh/curl to {SSH_HOST} failed: {proc.stderr.strip() or proc.stdout.strip()}")
+        raise RuntimeError(f"ssh to {SSH_HOST} failed: {proc.stderr.strip() or proc.stdout.strip()}")
     return proc.stdout
+
+
+def _api(method: str, path: str, body: dict | None = None) -> dict:
+    """Call the codeJung REST API and return the parsed JSON.
+
+    Remote mode: HTTPS to CODEJUNG_API_URL with CODEJUNG_API_TOKEN.
+    SSH mode:    curl against the loopback API on the host; the token is read
+                 there (from codejung.env) and never leaves that machine.
+    """
+    if REMOTE_URL:
+        data = json.dumps(body).encode() if body is not None else None
+        req = urllib.request.Request(
+            REMOTE_URL + path, data=data, method=method,
+            headers={"Authorization": f"Bearer {REMOTE_TOKEN}",
+                     "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.loads(resp.read().decode())
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")[:300]
+            raise RuntimeError(f"codeJung API {method} {path} -> {exc.code}: {detail}") from None
+    # SSH mode. cut -f2- (not -f2): tokens may legitimately contain '=' characters.
+    token_expr = f"TOKEN=$(grep ^CODEJUNG_SERVICE_API_TOKEN {ENV_PATH} | cut -d= -f2-)"
+    url = f"http://127.0.0.1:8080{path}"
+    if body is not None:
+        curl = (f"curl -s -X {method} {url} "
+                f'-H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" '
+                f"-d '{json.dumps(body)}'")
+    else:
+        curl = f'curl -s -X {method} {url} -H "Authorization: Bearer $TOKEN"'
+    return json.loads(_ssh(f"{token_expr}; {curl}"))
 
 
 def _submit(pr_url: str) -> str:
     if not _PR_URL_RE.match(pr_url):
         raise ValueError(f"invalid GitHub PR URL: {pr_url!r}")
-    body = json.dumps({"source": {"type": "github_pr", "prUrl": pr_url}})
-    out = _remote(
-        "curl -s -X POST http://127.0.0.1:8080/v1/jobs "
-        '-H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" '
-        f"-d '{body}'"
-    )
-    return json.loads(out)["jobId"]
+    return _api("POST", "/v1/jobs", {"source": {"type": "github_pr", "prUrl": pr_url}})["jobId"]
 
 
 def _submit_local_dir(container_path: str) -> str:
-    body = json.dumps({"source": {"type": "local_dir", "localDir": container_path}})
-    out = _remote(
-        "curl -s -X POST http://127.0.0.1:8080/v1/jobs "
-        '-H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" '
-        f"-d '{body}'"
-    )
-    return json.loads(out)["jobId"]
+    return _api("POST", "/v1/jobs",
+                {"source": {"type": "local_dir", "localDir": container_path}})["jobId"]
 
 
 def _stage_dir(local_path: str) -> tuple[str, str]:
@@ -142,21 +176,13 @@ def _sweep_stale_staging(max_age_min: int = 360) -> None:
 def _poll(job_id: str) -> dict:
     if not _JOB_ID_RE.match(job_id):
         raise ValueError(f"invalid job id: {job_id!r}")
-    out = _remote(
-        f"curl -s http://127.0.0.1:8080/v1/jobs/{job_id} "
-        '-H "Authorization: Bearer $TOKEN"'
-    )
-    return json.loads(out)
+    return _api("GET", f"/v1/jobs/{job_id}")
 
 
 def _result(job_id: str) -> dict:
     if not _JOB_ID_RE.match(job_id):
         raise ValueError(f"invalid job id: {job_id!r}")
-    out = _remote(
-        f"curl -s http://127.0.0.1:8080/v1/jobs/{job_id}/result "
-        '-H "Authorization: Bearer $TOKEN"'
-    )
-    return json.loads(out)
+    return _api("GET", f"/v1/jobs/{job_id}/result")
 
 
 def _terminal_response(job_id: str, status: str, job: dict) -> dict:
@@ -272,6 +298,11 @@ def review_dir(path: str, wait_secs: int = 300) -> dict:
         failed/timed_out → {"jobId","status","error"};
         still running → {"jobId","status":"running","hint": ...}.
     """
+    if REMOTE_URL:
+        return {"status": "error",
+                "error": ("review_dir rsyncs the directory to the host and needs SSH mode; "
+                          "it is not available against a remote CODEJUNG_API_URL. "
+                          "Use review_pr for remote reviews.")}
     _sweep_stale_staging()  # reap staging dirs orphaned by earlier timed-out jobs
     container_path, host_sub = _stage_dir(path)
 
