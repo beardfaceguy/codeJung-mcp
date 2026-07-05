@@ -35,12 +35,26 @@ STAGING_CONTAINER_DIR = "/review-staging"
 _PR_URL_RE = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/pull/\d+$")
 _JOB_ID_RE = re.compile(r"^cj_[0-9a-f]+$")
 
+
+def _safe_config_path(value: str, name: str) -> str:
+    """Operator-supplied paths are interpolated into a remote shell command (and
+    must stay unquoted so a leading ~ expands). Reject shell metacharacters and
+    whitespace so interpolation cannot inject commands."""
+    if re.search(r"""[\s;&|`$(){}<>*?!\\"']""", value):
+        raise ValueError(f"{name} contains unsafe characters: {value!r}")
+    return value
+
+
+ENV_PATH = _safe_config_path(ENV_PATH, "CODEJUNG_ENV_PATH")
+STAGING_HOST_DIR = _safe_config_path(STAGING_HOST_DIR, "CODEJUNG_REVIEW_STAGING")
+
 mcp = FastMCP("codejung")
 
 
 def _remote(curl_cmd: str) -> str:
     """Run a curl against the loopback API on the host; token stays on the host."""
-    token_expr = f"TOKEN=$(grep ^CODEJUNG_SERVICE_API_TOKEN {ENV_PATH} | cut -d= -f2)"
+    # cut -f2- (not -f2): tokens may legitimately contain '=' characters.
+    token_expr = f"TOKEN=$(grep ^CODEJUNG_SERVICE_API_TOKEN {ENV_PATH} | cut -d= -f2-)"
     proc = subprocess.run(
         ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", SSH_HOST,
          f"{token_expr}; {curl_cmd}"],
@@ -203,6 +217,10 @@ def review_dir(path: str, timeout_mins: int = 30) -> dict:
         {"jobId"/None,"status","error"} on failure/timeout.
     """
     container_path, host_sub = _stage_dir(path)
+    # NOTE: cleanup is deliberately NOT in a `finally`. The worker reads the
+    # staged files *during* the review, so unstaging on a client-side wait
+    # timeout would pull the rug out from under a still-running job. We only
+    # unstage once the job reaches a terminal state (or on an error path).
     try:
         job_id = _submit_local_dir(container_path)
         deadline = time.monotonic() + timeout_mins * 60
@@ -210,19 +228,26 @@ def review_dir(path: str, timeout_mins: int = 30) -> dict:
             job = _poll(job_id)
             status = job.get("status", "unknown")
             if status in ("succeeded", "failed", "timed_out"):
+                resp = {"jobId": job_id, "status": status}
                 if status == "succeeded":
                     r = _result(job_id)
-                    return {
-                        "jobId": job_id, "status": status,
-                        "summaryMarkdown": r.get("summaryMarkdown", ""),
-                        "findings": r.get("findings", []),
-                    }
-                return {"jobId": job_id, "status": status, "error": job.get("error")}
+                    resp["summaryMarkdown"] = r.get("summaryMarkdown", "")
+                    resp["findings"] = r.get("findings", [])
+                else:
+                    resp["error"] = job.get("error")
+                _unstage(host_sub)  # safe: job is terminal, files no longer needed
+                return resp
             time.sleep(15)
-        return {"jobId": job_id, "status": "timed_out",
-                "error": f"still running after {timeout_mins} min"}
-    finally:
+    except Exception:
         _unstage(host_sub)
+        raise
+    # Client-side wait elapsed but the job is still running and still needs the
+    # staged files — leave them in place; the job (and get_review) can finish.
+    return {"jobId": job_id, "status": "timed_out",
+            "error": (f"still running after {timeout_mins} min; poll "
+                      f"get_review('{job_id}'). Staged copy left at {host_sub} "
+                      f"on the host until the job completes."),
+            "stagedHostDir": host_sub}
 
 
 if __name__ == "__main__":
