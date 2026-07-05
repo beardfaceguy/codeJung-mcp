@@ -100,3 +100,46 @@ python3 -c "import codejung_mcp as m; print(m.review_pr('https://github.com/OWNE
 - `review_dir` copies the target directory to the host (excluding `.git`,
   `node_modules`, virtualenvs, build output) and removes the staged copy when the
   review finishes.
+
+## Remote HTTP endpoint (web / URL-based clients)
+
+For MCP clients that connect to a **URL** instead of spawning a local process
+(Cursor remote servers, ChatGPT/Grok connectors, etc.), codeJung also runs a
+streamable-HTTP MCP server on the host — `codejung_mcp_http.py`. Unlike the
+stdio server, it runs **on the codeJung host** and talks to the API directly
+over localhost (no SSH). It exposes the PR tools only (`review_pr`,
+`submit_review`, `get_review`) — remote clients have no local dir to review.
+
+**Public endpoint:** `https://codejung.wint3rmute.com/mcp`
+**Auth:** `Authorization: Bearer <CODEJUNG_SERVICE_API_TOKEN>` (enforced at the
+Caddy edge; the request never reaches the MCP server without it).
+
+Exposure is off by default — open it for a demo with
+`agentic_scripts/codejung-expose/codejung-expose.sh enable` (and `disable` after).
+
+### Cursor (remote server)
+
+```json
+"codejung-remote": {
+  "url": "https://codejung.wint3rmute.com/mcp",
+  "headers": { "Authorization": "Bearer <TOKEN>" }
+}
+```
+
+### Other web agents
+
+ChatGPT (custom connectors) and Grok can point at the same URL, but their MCP
+client/auth support varies by product and plan (some expect OAuth rather than a
+static bearer header). The endpoint itself is a standards-compliant
+streamable-HTTP MCP server with a bearer gate; whether a given product accepts
+it depends on that product.
+
+### Host-side deployment (reference)
+
+- venv: `~/.codejung-mcp-venv` (`pip install mcp`)
+- service: `codejung-mcp-http.service` (systemd), binds `127.0.0.1:8765`
+- Caddy: `/mcp` route, bearer-gated via `CJ_MCP_TOKEN`, rewrites upstream Host
+  to `127.0.0.1:8765` (the MCP SDK's DNS-rebinding guard only trusts localhost)
+
+Redeploy after editing this file: copy it to the host and
+`sudo systemctl restart codejung-mcp-http`.
