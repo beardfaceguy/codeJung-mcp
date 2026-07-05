@@ -1,0 +1,7 @@
+# codejung-mcp — Python dependencies
+mcp>=1.10
+
+# System requirements (not pip-installable):
+#   python3 >= 3.10
+#   openssh client   (all API calls run on the service host via SSH)
+#   passwordless SSH to the service host (default: codejung)

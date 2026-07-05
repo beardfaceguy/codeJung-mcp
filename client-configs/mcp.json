@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "codejung": {
+      "command": "python3",
+      "args": ["/home/beardface/work/agentic_scripts/codejung-mcp/codejung_mcp.py"],
+      "env": {
+        "CODEJUNG_SSH_HOST": "codejung"
+      }
+    }
+  }
+}
