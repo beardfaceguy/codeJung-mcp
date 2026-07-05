@@ -16,6 +16,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import uuid
 
@@ -158,6 +159,45 @@ def _result(job_id: str) -> dict:
     return json.loads(out)
 
 
+def _terminal_response(job_id: str, status: str, job: dict) -> dict:
+    """Build the tool response for a job that has reached a terminal state."""
+    resp = {"jobId": job_id, "status": status}
+    if status == "succeeded":
+        r = _result(job_id)
+        resp["summaryMarkdown"] = r.get("summaryMarkdown", "")
+        resp["findings"] = r.get("findings", [])
+    else:
+        resp["error"] = job.get("error")
+    return resp
+
+
+def _wait_for_job(job_id: str, wait_secs: int, *, label: str = "") -> dict | None:
+    """Poll a job for up to wait_secs, emitting progress to stderr each cycle so
+    the caller can see it is alive (never a silent multi-minute hang). Returns
+    the terminal response once the job finishes, or None if wait_secs elapses
+    while the job is still running (caller then hands back a resumable jobId)."""
+    start = time.monotonic()
+    polls = 0
+    while True:
+        job = _poll(job_id)
+        status = job.get("status", "unknown")
+        polls += 1
+        print(f"[codejung] {label or job_id}: {status} "
+              f"({int(time.monotonic() - start)}s, poll {polls})",
+              file=sys.stderr, flush=True)
+        if status in ("succeeded", "failed", "timed_out"):
+            return _terminal_response(job_id, status, job)
+        if time.monotonic() - start >= wait_secs:
+            return None
+        time.sleep(15)
+
+
+def _running_response(job_id: str, wait_secs: int) -> dict:
+    return {"jobId": job_id, "status": "running",
+            "hint": (f"still running after {wait_secs}s; "
+                     f"call get_review('{job_id}') to fetch the result when done")}
+
+
 @mcp.tool()
 def submit_review(pr_url: str) -> dict:
     """Submit a GitHub PR for codeJung review and return immediately.
@@ -190,93 +230,74 @@ def get_review(job_id: str) -> dict:
 
 
 @mcp.tool()
-def review_pr(pr_url: str, timeout_mins: int = 30) -> dict:
-    """Submit a GitHub PR, wait for the review to finish, and return findings.
+def review_pr(pr_url: str, wait_secs: int = 300) -> dict:
+    """Submit a GitHub PR for review and wait a bounded time for the result.
 
-    This is the one-shot workhorse: it submits, polls until the review completes
-    (or times out), and returns the review markdown + structured findings.
+    Submits the job, then waits up to wait_secs (emitting progress to stderr).
+    If the review finishes in that window, returns the markdown + findings. If
+    not, returns immediately with status "running" and a jobId to poll via
+    get_review — it never blocks indefinitely. Set wait_secs=0 to return as soon
+    as the job is submitted (equivalent to submit_review). For guaranteed
+    non-blocking use in clients with short tool-call timeouts, prefer
+    submit_review + get_review.
 
     Args:
         pr_url: Full GitHub PR URL, e.g. https://github.com/owner/repo/pull/123
-        timeout_mins: How long to wait before giving up (default 30).
+        wait_secs: Max seconds to wait inline for completion (default 300).
     Returns:
-        {"jobId","status","summaryMarkdown","findings"} on success, or
-        {"jobId","status","error"} if it failed/timed out.
+        succeeded → {"jobId","status","summaryMarkdown","findings"};
+        failed/timed_out → {"jobId","status","error"};
+        still running → {"jobId","status":"running","hint": ...}.
     """
     job_id = _submit(pr_url)
-    deadline = time.monotonic() + timeout_mins * 60
-    while time.monotonic() < deadline:
-        job = _poll(job_id)
-        status = job.get("status", "unknown")
-        if status in ("succeeded", "failed", "timed_out"):
-            if status == "succeeded":
-                r = _result(job_id)
-                return {
-                    "jobId": job_id, "status": status,
-                    "summaryMarkdown": r.get("summaryMarkdown", ""),
-                    "findings": r.get("findings", []),
-                }
-            return {"jobId": job_id, "status": status, "error": job.get("error")}
-        time.sleep(15)
-    return {"jobId": job_id, "status": "timed_out",
-            "error": f"still running after {timeout_mins} min; poll get_review('{job_id}') later"}
+    resp = _wait_for_job(job_id, wait_secs, label=pr_url)
+    return resp if resp is not None else _running_response(job_id, wait_secs)
 
 
 @mcp.tool()
-def review_dir(path: str, timeout_mins: int = 30) -> dict:
+def review_dir(path: str, wait_secs: int = 300) -> dict:
     """Review a local directory of code with codeJung (full-file scan, no PR needed).
 
     Stages the directory to the codeJung host, runs a full-file review of every
-    source file in it, and returns findings. Use this for code that is not (yet)
-    a GitHub PR — e.g. a working tree or a standalone script directory.
+    source file in it, and waits up to wait_secs (emitting progress to stderr).
+    If the review finishes in that window, returns the markdown + findings; if
+    not, returns status "running" with a jobId to poll via get_review — it never
+    blocks indefinitely. Use this for code that is not (yet) a GitHub PR.
 
     Args:
         path: Local directory path on this machine to review.
-        timeout_mins: How long to wait before giving up (default 30).
+        wait_secs: Max seconds to wait inline for completion (default 300).
     Returns:
-        {"jobId","status","summaryMarkdown","findings"} on success, or
-        {"jobId"/None,"status","error"} on failure/timeout.
+        succeeded → {"jobId","status","summaryMarkdown","findings"};
+        failed/timed_out → {"jobId","status","error"};
+        still running → {"jobId","status":"running","hint": ...}.
     """
     _sweep_stale_staging()  # reap staging dirs orphaned by earlier timed-out jobs
     container_path, host_sub = _stage_dir(path)
 
-    # Submit first, in its own guard, so job_id is unambiguously bound before the
-    # polling loop and the timeout return below.
+    # Submit first, in its own guard, so job_id is unambiguously bound.
     try:
         job_id = _submit_local_dir(container_path)
     except Exception:
         _unstage(host_sub)
         raise
 
-    # NOTE: cleanup is deliberately NOT in a `finally`. The worker reads the
-    # staged files *during* the review, so unstaging on a client-side wait
-    # timeout would pull the rug out from under a still-running job. We only
-    # unstage once the job reaches a terminal state (or on an error path).
+    # Cleanup is deliberately NOT in a `finally`: the worker reads the staged
+    # files *during* the review, so unstaging while the job is still running
+    # (the wait-elapsed path) would pull the rug out from under it. We unstage
+    # only once the job is terminal, or on an error path.
     try:
-        deadline = time.monotonic() + timeout_mins * 60
-        while time.monotonic() < deadline:
-            job = _poll(job_id)
-            status = job.get("status", "unknown")
-            if status in ("succeeded", "failed", "timed_out"):
-                resp = {"jobId": job_id, "status": status}
-                if status == "succeeded":
-                    r = _result(job_id)
-                    resp["summaryMarkdown"] = r.get("summaryMarkdown", "")
-                    resp["findings"] = r.get("findings", [])
-                else:
-                    resp["error"] = job.get("error")
-                _unstage(host_sub)  # safe: job is terminal, files no longer needed
-                return resp
-            time.sleep(15)
+        resp = _wait_for_job(job_id, wait_secs, label=path)
     except Exception:
         _unstage(host_sub)
         raise
-    # Client-side wait elapsed but the job is still running and still needs the
-    # staged files — leave them in place; the job (and get_review) can finish.
-    # The staged copy is reaped by _sweep_stale_staging() on a later run.
-    return {"jobId": job_id, "status": "timed_out",
-            "error": (f"still running after {timeout_mins} min; "
-                      f"poll get_review('{job_id}').")}
+
+    if resp is not None:
+        _unstage(host_sub)  # job is terminal — staged files no longer needed
+        return resp
+    # Still running: leave the staged files in place so the job (and a later
+    # get_review) can complete. The copy is reaped by _sweep_stale_staging().
+    return _running_response(job_id, wait_secs)
 
 
 if __name__ == "__main__":

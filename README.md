@@ -20,10 +20,19 @@ match. The quickest health check is the smoke test in [Verifying](#verifying).
 
 | Tool | Purpose |
 |------|---------|
-| `review_pr(pr_url, timeout_mins=30)` | Submit a GitHub PR, wait, return review markdown + findings (one-shot). |
+| `review_pr(pr_url, wait_secs=300)` | Submit a GitHub PR, wait up to `wait_secs`, return review markdown + findings. |
 | `submit_review(pr_url)` | Submit a PR and return `jobId` immediately (for long reviews). |
 | `get_review(job_id)` | Status, plus result once the job has succeeded. |
-| `review_dir(path, timeout_mins=30)` | Review a **local directory** (full-file scan, no PR needed) — stages it to the host and reviews every source file. |
+| `review_dir(path, wait_secs=300)` | Review a **local directory** (full-file scan, no PR needed) — stages it to the host and reviews every source file. |
+
+### Blocking vs non-blocking
+
+`review_pr` / `review_dir` wait *at most* `wait_secs` for the review, emitting
+progress to stderr, then return `{"status":"running","jobId":...}` if it hasn't
+finished — they never block indefinitely. Fetch a still-running result later with
+`get_review(job_id)`. Set `wait_secs=0` to return as soon as the job is
+submitted. For clients with short tool-call timeouts, prefer the non-blocking
+pattern: `submit_review` → `get_review`.
 
 ## Requirements
 
