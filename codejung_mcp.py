@@ -35,12 +35,27 @@ STAGING_CONTAINER_DIR = "/review-staging"
 _PR_URL_RE = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/pull/\d+$")
 _JOB_ID_RE = re.compile(r"^cj_[0-9a-f]+$")
 
+
+def _safe_config_path(value: str, name: str) -> str:
+    """Operator-supplied paths are interpolated into a remote shell command (and
+    must stay unquoted so a leading ~ expands). Allow-list path-safe characters
+    only — this rejects globs ([ ]), comments (#), quotes, whitespace, and every
+    command/redirection metacharacter, so interpolation cannot inject commands."""
+    if not re.fullmatch(r"[A-Za-z0-9._/~-]+", value):
+        raise ValueError(f"{name} has non-path characters: {value!r}")
+    return value
+
+
+ENV_PATH = _safe_config_path(ENV_PATH, "CODEJUNG_ENV_PATH")
+STAGING_HOST_DIR = _safe_config_path(STAGING_HOST_DIR, "CODEJUNG_REVIEW_STAGING")
+
 mcp = FastMCP("codejung")
 
 
 def _remote(curl_cmd: str) -> str:
     """Run a curl against the loopback API on the host; token stays on the host."""
-    token_expr = f"TOKEN=$(grep ^CODEJUNG_SERVICE_API_TOKEN {ENV_PATH} | cut -d= -f2)"
+    # cut -f2- (not -f2): tokens may legitimately contain '=' characters.
+    token_expr = f"TOKEN=$(grep ^CODEJUNG_SERVICE_API_TOKEN {ENV_PATH} | cut -d= -f2-)"
     proc = subprocess.run(
         ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", SSH_HOST,
          f"{token_expr}; {curl_cmd}"],
@@ -101,6 +116,26 @@ def _stage_dir(local_path: str) -> tuple[str, str]:
 def _unstage(host_sub: str) -> None:
     subprocess.run(["ssh", "-o", "BatchMode=yes", SSH_HOST, f"rm -rf {host_sub}"],
                    capture_output=True, text=True, timeout=30)
+
+
+def _sweep_stale_staging(max_age_min: int = 360) -> None:
+    """Best-effort removal of staging dirs orphaned by timed-out jobs. The age
+    threshold is deliberately generous (default 6h) so an in-flight review is
+    never swept out from under a running job. Failures are ignored.
+
+    Only dirs whose names match our own stage-id shape (12 hex chars) are
+    removed, so even a misconfigured STAGING_HOST_DIR cannot delete unrelated
+    directories."""
+    hex12 = "[0-9a-f]" * 12  # matches uuid4().hex[:12] created by _stage_dir
+    try:
+        subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", SSH_HOST,
+             f"find {STAGING_HOST_DIR} -mindepth 1 -maxdepth 1 -type d "
+             f"-name '{hex12}' -mmin +{max_age_min} -exec rm -rf {{}} + 2>/dev/null || true"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        pass
 
 
 def _poll(job_id: str) -> dict:
@@ -202,27 +237,46 @@ def review_dir(path: str, timeout_mins: int = 30) -> dict:
         {"jobId","status","summaryMarkdown","findings"} on success, or
         {"jobId"/None,"status","error"} on failure/timeout.
     """
+    _sweep_stale_staging()  # reap staging dirs orphaned by earlier timed-out jobs
     container_path, host_sub = _stage_dir(path)
+
+    # Submit first, in its own guard, so job_id is unambiguously bound before the
+    # polling loop and the timeout return below.
     try:
         job_id = _submit_local_dir(container_path)
+    except Exception:
+        _unstage(host_sub)
+        raise
+
+    # NOTE: cleanup is deliberately NOT in a `finally`. The worker reads the
+    # staged files *during* the review, so unstaging on a client-side wait
+    # timeout would pull the rug out from under a still-running job. We only
+    # unstage once the job reaches a terminal state (or on an error path).
+    try:
         deadline = time.monotonic() + timeout_mins * 60
         while time.monotonic() < deadline:
             job = _poll(job_id)
             status = job.get("status", "unknown")
             if status in ("succeeded", "failed", "timed_out"):
+                resp = {"jobId": job_id, "status": status}
                 if status == "succeeded":
                     r = _result(job_id)
-                    return {
-                        "jobId": job_id, "status": status,
-                        "summaryMarkdown": r.get("summaryMarkdown", ""),
-                        "findings": r.get("findings", []),
-                    }
-                return {"jobId": job_id, "status": status, "error": job.get("error")}
+                    resp["summaryMarkdown"] = r.get("summaryMarkdown", "")
+                    resp["findings"] = r.get("findings", [])
+                else:
+                    resp["error"] = job.get("error")
+                _unstage(host_sub)  # safe: job is terminal, files no longer needed
+                return resp
             time.sleep(15)
-        return {"jobId": job_id, "status": "timed_out",
-                "error": f"still running after {timeout_mins} min"}
-    finally:
+    except Exception:
         _unstage(host_sub)
+        raise
+    # Client-side wait elapsed but the job is still running and still needs the
+    # staged files — leave them in place; the job (and get_review) can finish.
+    # The staged copy is reaped by _sweep_stale_staging() on a later run.
+    return {"jobId": job_id, "status": "timed_out",
+            "error": (f"still running after {timeout_mins} min; "
+                      f"poll get_review('{job_id}').")}
 
 
 if __name__ == "__main__":
