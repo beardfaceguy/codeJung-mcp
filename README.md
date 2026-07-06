@@ -112,10 +112,15 @@ over localhost (no SSH). It exposes the PR tools only (`review_pr`,
 
 **Public endpoint:** `https://codejung.wint3rmute.com/mcp`
 **Auth:** `Authorization: Bearer <CODEJUNG_SERVICE_API_TOKEN>` (enforced at the
-Caddy edge; the request never reaches the MCP server without it).
+edge; the request never reaches the MCP server without it).
 
-Exposure is off by default — open it for a demo with
-`agentic_scripts/codejung-expose/codejung-expose.sh enable` (and `disable` after).
+**Always on:** codeJung is hosted permanently via the router's nginx reverse
+proxy (a `codejung.wint3rmute.com` vhost on the shared `:443`, alongside
+vikunja/media), which terminates a Let's Encrypt cert and proxies to the Pi's
+Caddy (which routes `/` → API and `/mcp` → the MCP server). No port-forwarding
+or demo toggling is needed — the endpoint is live. (The old `codejung-expose` /
+`codejung-demo` port-forward scripts are retired: they would hijack `:443` from
+the router nginx and break the other services.)
 
 ### Cursor (remote server)
 
