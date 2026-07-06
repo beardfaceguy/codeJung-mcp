@@ -3,155 +3,167 @@
 An [MCP](https://modelcontextprotocol.io) server that exposes the self-hosted
 [codeJung](https://github.com/beardfaceguy/codeJung) code-review service as tools
 any MCP client can call — Claude Code, Claude Desktop, Cursor, Codex CLI,
-Windsurf, and others.
+Windsurf, and web/URL-based clients.
 
-It is a thin client: it depends only on codeJung's stable `/v1` HTTP API, not on
-any codeJung internals. The service binds to loopback on its host, so every call
-is executed on that host over SSH — the service token is read there and never
-leaves the machine.
+It's a thin client over codeJung's stable `/v1` HTTP API. There are **two ways
+to connect** (see [Installation](#installation)):
 
-## Target API
-
-Speaks codeJung's **`/v1`** job API (`POST /v1/jobs`, `GET /v1/jobs/{id}`,
-`GET /v1/jobs/{id}/result`). If codeJung ever breaks `/v1`, bump this client to
-match. The quickest health check is the smoke test in [Verifying](#verifying).
+- **Remote (recommended):** point your client at the hosted URL — nothing to
+  install, works from anywhere.
+- **Local:** run the stdio server (`codejung_mcp.py`) from a clone of this repo.
 
 ## Tools
 
 | Tool | Purpose |
 |------|---------|
-| `review_pr(pr_url, wait_secs=300)` | Submit a GitHub PR, wait up to `wait_secs`, return review markdown + findings. |
-| `submit_review(pr_url)` | Submit a PR and return `jobId` immediately (for long reviews). |
+| `review_pr(pr_url, wait_secs=300, post_comments=True)` | Submit a GitHub PR, wait up to `wait_secs`, return review markdown + findings. |
+| `submit_review(pr_url, post_comments=True)` | Submit a PR and return `jobId` immediately (for long reviews). |
 | `get_review(job_id)` | Status, plus result once the job has succeeded. |
-| `review_dir(path, wait_secs=300)` | Review a **local directory** (full-file scan, no PR needed) — stages it to the host and reviews every source file. |
+| `review_dir(path, wait_secs=300)` | Review a **local directory** (full-file scan, no PR needed). *Local stdio + SSH mode only.* |
+
+The selected LLM in your client is irrelevant — the client (not the model)
+drives the server, so it works with any tool-calling model (GPT, Claude, Gemini,
+Grok, …). MCP tools run in the client's **Agent mode**.
 
 ### Review-only (don't post to the PR)
 
 `review_pr` / `submit_review` take `post_comments` (default `True`). Pass
 `post_comments=False` to review a PR **without posting inline comments** — the
-findings come back to you (in the `findings` array + `summaryMarkdown`) and the
-PR is left untouched. Good for "review-then-decide" agent workflows.
+findings come back to you (`findings` array + `summaryMarkdown`) and the PR is
+left untouched. Good for "review-then-decide" agent workflows.
 
 ### Blocking vs non-blocking
 
-`review_pr` / `review_dir` wait *at most* `wait_secs` for the review, emitting
-progress to stderr, then return `{"status":"running","jobId":...}` if it hasn't
-finished — they never block indefinitely. Fetch a still-running result later with
-`get_review(job_id)`. Set `wait_secs=0` to return as soon as the job is
-submitted. For clients with short tool-call timeouts, prefer the non-blocking
-pattern: `submit_review` → `get_review`.
+`review_pr` / `review_dir` wait *at most* `wait_secs`, emitting progress to
+stderr, then return `{"status":"running","jobId":...}` if not finished — they
+never block indefinitely. Fetch a still-running result later with
+`get_review(job_id)`. Set `wait_secs=0` to return right after submit. For clients
+with short tool-call timeouts, prefer `submit_review` → `get_review`.
 
-## Requirements
+## Installation
 
-- python3 ≥ 3.10, `pip install -r requirements.txt` (installs `mcp`)
-- openssh client + passwordless SSH to the codeJung host
-- `rsync` on both machines (only needed for `review_dir`)
-- codeJung service running on the host (`~/codeJung/deploy`, api + worker)
+Pick **one** of the two options below. You'll need the codeJung **bearer token**
+either way — ask the maintainer (it's the `CODEJUNG_SERVICE_API_TOKEN`).
+
+### Option A — Remote URL (recommended; nothing to install)
+
+The service is hosted at **`https://codejung.wint3rmute.com/mcp`** — always on,
+TLS, bearer-token gated. No clone, no Python, no SSH; works from any network.
+
+**Cursor** — merge into `~/.cursor/mcp.json` (under `mcpServers`):
+
+```json
+{
+  "mcpServers": {
+    "codejung": {
+      "url": "https://codejung.wint3rmute.com/mcp",
+      "headers": { "Authorization": "Bearer <TOKEN>" }
+    }
+  }
+}
+```
+
+**Claude Code** — one command:
+
+```bash
+claude mcp add --transport http codejung https://codejung.wint3rmute.com/mcp \
+  --header "Authorization: Bearer <TOKEN>"
+```
+
+**Claude Desktop / Windsurf / other URL-capable clients** — add the same
+`url` + `headers` entry to that client's MCP config file.
+
+Then restart the client, switch to **Agent mode**, and try:
+*"review https://github.com/owner/repo/pull/123 with codejung"*.
+
+> Web clients (ChatGPT/Grok) can point at the same URL, but their MCP client and
+> auth support vary by product/plan (some expect OAuth rather than a static
+> bearer header). The endpoint is a standards-compliant streamable-HTTP MCP
+> server; whether a given product accepts it depends on that product.
+
+### Option B — Local stdio server (from a clone)
+
+Run the stdio server yourself. Needed for `review_dir` (local-directory reviews),
+or if you'd rather not use the hosted URL.
+
+1. **Clone + install deps:**
+   ```bash
+   git clone git@github.com:beardfaceguy/codeJung-mcp.git
+   cd codeJung-mcp
+   pip install -r requirements.txt        # installs `mcp`; needs python3 ≥ 3.10
+   ```
+2. **Choose how it reaches codeJung** (via env vars — see [Configuration](#configuration)):
+   - **Remote API over HTTPS** (works anywhere):
+     `CODEJUNG_API_URL=https://codejung.wint3rmute.com` + `CODEJUNG_API_TOKEN=<token>`
+   - **SSH-to-loopback** (on the home LAN; the token is read on the host and
+     never leaves it): `CODEJUNG_SSH_HOST=codejung` + passwordless SSH to that host.
+3. **Register with your client**, e.g. Claude Code (remote-API mode):
+   ```bash
+   claude mcp add codejung -s user \
+     -e CODEJUNG_API_URL=https://codejung.wint3rmute.com \
+     -e CODEJUNG_API_TOKEN=<token> \
+     -- python3 /ABS/PATH/codeJung-mcp/codejung_mcp.py
+   ```
+   - **Cursor / Claude Desktop / Windsurf:** merge `client-configs/mcp.json`
+     (the `command`/`args`/`env` form), editing the absolute path + env.
+   - **Codex CLI:** merge `client-configs/codex-config.toml` into `~/.codex/config.toml`.
+
+> `review_dir` requires **SSH mode** (it rsyncs the target dir to the host); it
+> is unavailable in remote-URL mode and returns a clear error there.
 
 ## Configuration (env vars)
 
 | Var | Default | Meaning |
 |-----|---------|---------|
-| `CODEJUNG_SSH_HOST` | `codejung` | SSH host running the service |
-| `CODEJUNG_ENV_PATH` | `~/codeJung/deploy/codejung.env` | path to `codejung.env` on the host (holds the service token) |
-| `CODEJUNG_REVIEW_STAGING` | `~/cj-review-staging` | host dir bind-mounted into the worker at `/review-staging` (used by `review_dir`) |
+| `CODEJUNG_API_URL` | *(unset)* | If set, the stdio server calls the public REST API over HTTPS (remote mode). |
+| `CODEJUNG_API_TOKEN` | *(unset)* | Bearer token for remote mode (required when `CODEJUNG_API_URL` is set). |
+| `CODEJUNG_SSH_HOST` | `codejung` | SSH host running the service (SSH mode, when `CODEJUNG_API_URL` is unset). |
+| `CODEJUNG_ENV_PATH` | `~/codeJung/deploy/codejung.env` | Path to `codejung.env` on the host (SSH mode; holds the token). |
+| `CODEJUNG_REVIEW_STAGING` | `~/cj-review-staging` | Host staging dir for `review_dir` (SSH mode). |
 
-> `review_dir` requires the worker container to bind-mount the staging dir. In
-> `deploy/docker-compose.yml` the worker must have:
-> `- ${CODEJUNG_REVIEW_STAGING:-/home/you/cj-review-staging}:/review-staging:ro`
-
-## Install per client
-
-The same stdio server works with any local MCP client. Ready-made config
-snippets are in [`client-configs/`](client-configs/).
-
-### Claude Code
-
-```bash
-claude mcp add codejung -s user -- python3 /path/to/codeJung-mcp/codejung_mcp.py
-```
-
-### Cursor / Claude Desktop / Windsurf
-
-Merge the `codejung` entry from `client-configs/mcp.json` into the client's MCP
-config (paths listed in `client-configs/README.md`). Edit the absolute path to
-match where you cloned this repo. MCP tools run in **Agent mode**, and the
-selected model is irrelevant — the client (not the model) drives the server, so
-it works with any tool-calling model (GPT, Claude, Gemini, Grok, …).
-
-### Codex CLI
-
-Merge `client-configs/codex-config.toml` into `~/.codex/config.toml`.
-
-## Verifying
+## Verifying (Option B)
 
 ```bash
 pip install -r requirements.txt
-# smoke test — should print the tool names:
-python3 -c "import asyncio, codejung_mcp as m; \
-print([t.name for t in asyncio.run(m.mcp.list_tools())])"
-# end-to-end — the host's models must be reachable:
-python3 -c "import codejung_mcp as m; print(m.review_pr('https://github.com/OWNER/REPO/pull/N')['status'])"
+# tools register?
+python3 -c "import asyncio, codejung_mcp as m; print([t.name for t in asyncio.run(m.mcp.list_tools())])"
+# end-to-end (remote mode): set the env first, then submit a real PR
+CODEJUNG_API_URL=https://codejung.wint3rmute.com CODEJUNG_API_TOKEN=<token> \
+  python3 -c "import codejung_mcp as m; print(m.review_pr('https://github.com/OWNER/REPO/pull/N', post_comments=False)['status'])"
 ```
 
-## Usage in a session
-
-> "review https://github.com/owner/repo/pull/123 with codejung"
-> "use codejung to review the directory ./my-service"
+For Option A, just confirm the endpoint is reachable:
+```bash
+curl https://codejung.wint3rmute.com/v1/health     # -> {"status":"ok"}
+```
 
 ## Security notes
 
-- The service token is read on the host and never transits to the client.
-- PR URLs and job IDs are strictly validated before being interpolated into the
-  remote command, to prevent shell injection.
-- `review_dir` copies the target directory to the host (excluding `.git`,
-  `node_modules`, virtualenvs, build output) and removes the staged copy when the
-  review finishes.
+- The bearer token gates all `/v1/jobs*` endpoints (constant-time check) and the
+  `/mcp` endpoint. Keep it secret; don't paste it in shared channels.
+- In SSH mode the token is read on the host and never transits to the client.
+- PR URLs and job IDs are strictly validated before interpolation into any
+  remote command (prevents shell injection).
+- `review_dir` copies the target dir to the host (excluding `.git`,
+  `node_modules`, virtualenvs, build output) and removes the staged copy after.
 
-## Remote HTTP endpoint (web / URL-based clients)
+## How it's hosted (maintainer reference)
 
-For MCP clients that connect to a **URL** instead of spawning a local process
-(Cursor remote servers, ChatGPT/Grok connectors, etc.), codeJung also runs a
-streamable-HTTP MCP server on the host — `codejung_mcp_http.py`. Unlike the
-stdio server, it runs **on the codeJung host** and talks to the API directly
-over localhost (no SSH). It exposes the PR tools only (`review_pr`,
-`submit_review`, `get_review`) — remote clients have no local dir to review.
+codeJung is served permanently at `https://codejung.wint3rmute.com` via the
+router's nginx reverse proxy (a vhost on the shared `:443`, alongside other
+services), terminating a Let's Encrypt cert and proxying to the Pi's Caddy, which
+routes `/` → codeJung REST API and `/mcp` → the streamable-HTTP MCP server
+(`codejung_mcp_http.py`).
 
-**Public endpoint:** `https://codejung.wint3rmute.com/mcp`
-**Auth:** `Authorization: Bearer <CODEJUNG_SERVICE_API_TOKEN>` (enforced at the
-edge; the request never reaches the MCP server without it).
+Host-side pieces:
+- Remote MCP server: `codejung_mcp_http.py` runs on the host (venv
+  `~/.codejung-mcp-venv`), systemd unit `codejung-mcp-http.service`, binds
+  `127.0.0.1:8765`.
+- Caddy `/mcp` route: bearer-gated via `CJ_MCP_TOKEN`, rewrites upstream Host to
+  `127.0.0.1:8765` (the MCP SDK's DNS-rebinding guard only trusts localhost).
 
-**Always on:** codeJung is hosted permanently via the router's nginx reverse
-proxy (a `codejung.wint3rmute.com` vhost on the shared `:443`, alongside
-vikunja/media), which terminates a Let's Encrypt cert and proxies to the Pi's
-Caddy (which routes `/` → API and `/mcp` → the MCP server). No port-forwarding
-or demo toggling is needed — the endpoint is live. (The old `codejung-expose` /
-`codejung-demo` port-forward scripts are retired: they would hijack `:443` from
-the router nginx and break the other services.)
-
-### Cursor (remote server)
-
-```json
-"codejung-remote": {
-  "url": "https://codejung.wint3rmute.com/mcp",
-  "headers": { "Authorization": "Bearer <TOKEN>" }
-}
+Redeploy `codejung_mcp_http.py` after editing:
+```bash
+scp codejung_mcp_http.py codejung:~/codeJung-mcp-http.py
+ssh codejung 'sudo systemctl restart codejung-mcp-http'
 ```
-
-### Other web agents
-
-ChatGPT (custom connectors) and Grok can point at the same URL, but their MCP
-client/auth support varies by product and plan (some expect OAuth rather than a
-static bearer header). The endpoint itself is a standards-compliant
-streamable-HTTP MCP server with a bearer gate; whether a given product accepts
-it depends on that product.
-
-### Host-side deployment (reference)
-
-- venv: `~/.codejung-mcp-venv` (`pip install mcp`)
-- service: `codejung-mcp-http.service` (systemd), binds `127.0.0.1:8765`
-- Caddy: `/mcp` route, bearer-gated via `CJ_MCP_TOKEN`, rewrites upstream Host
-  to `127.0.0.1:8765` (the MCP SDK's DNS-rebinding guard only trusts localhost)
-
-Redeploy after editing this file: copy it to the host and
-`sudo systemctl restart codejung-mcp-http`.
