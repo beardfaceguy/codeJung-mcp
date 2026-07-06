@@ -25,6 +25,13 @@ match. The quickest health check is the smoke test in [Verifying](#verifying).
 | `get_review(job_id)` | Status, plus result once the job has succeeded. |
 | `review_dir(path, wait_secs=300)` | Review a **local directory** (full-file scan, no PR needed) — stages it to the host and reviews every source file. |
 
+### Review-only (don't post to the PR)
+
+`review_pr` / `submit_review` take `post_comments` (default `True`). Pass
+`post_comments=False` to review a PR **without posting inline comments** — the
+findings come back to you (in the `findings` array + `summaryMarkdown`) and the
+PR is left untouched. Good for "review-then-decide" agent workflows.
+
 ### Blocking vs non-blocking
 
 `review_pr` / `review_dir` wait *at most* `wait_secs` for the review, emitting

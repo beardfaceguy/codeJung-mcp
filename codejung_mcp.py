@@ -112,10 +112,13 @@ def _api(method: str, path: str, body: dict | None = None) -> dict:
     return json.loads(_ssh(f"{token_expr}; {curl}"))
 
 
-def _submit(pr_url: str) -> str:
+def _submit(pr_url: str, post: bool = True) -> str:
     if not _PR_URL_RE.match(pr_url):
         raise ValueError(f"invalid GitHub PR URL: {pr_url!r}")
-    return _api("POST", "/v1/jobs", {"source": {"type": "github_pr", "prUrl": pr_url}})["jobId"]
+    payload: dict = {"source": {"type": "github_pr", "prUrl": pr_url}}
+    if not post:
+        payload["reviewConfig"] = {"post": False}
+    return _api("POST", "/v1/jobs", payload)["jobId"]
 
 
 def _submit_local_dir(container_path: str) -> str:
@@ -225,15 +228,17 @@ def _running_response(job_id: str, wait_secs: int) -> dict:
 
 
 @mcp.tool()
-def submit_review(pr_url: str) -> dict:
+def submit_review(pr_url: str, post_comments: bool = True) -> dict:
     """Submit a GitHub PR for codeJung review and return immediately.
 
     Args:
         pr_url: Full GitHub PR URL, e.g. https://github.com/owner/repo/pull/123
+        post_comments: If False, the review does NOT post inline comments to the
+            PR — findings are only returned to you (via get_review). Default True.
     Returns:
         {"jobId": "cj_...", "status": "queued"} — poll with get_review.
     """
-    return {"jobId": _submit(pr_url), "status": "queued"}
+    return {"jobId": _submit(pr_url, post=post_comments), "status": "queued"}
 
 
 @mcp.tool()
@@ -256,7 +261,7 @@ def get_review(job_id: str) -> dict:
 
 
 @mcp.tool()
-def review_pr(pr_url: str, wait_secs: int = 300) -> dict:
+def review_pr(pr_url: str, wait_secs: int = 300, post_comments: bool = True) -> dict:
     """Submit a GitHub PR for review and wait a bounded time for the result.
 
     Submits the job, then waits up to wait_secs (emitting progress to stderr).
@@ -270,12 +275,14 @@ def review_pr(pr_url: str, wait_secs: int = 300) -> dict:
     Args:
         pr_url: Full GitHub PR URL, e.g. https://github.com/owner/repo/pull/123
         wait_secs: Max seconds to wait inline for completion (default 300).
+        post_comments: If False, the review does NOT post inline comments to the
+            PR — findings are only returned to you here. Default True.
     Returns:
         succeeded → {"jobId","status","summaryMarkdown","findings"};
         failed/timed_out → {"jobId","status","error"};
         still running → {"jobId","status":"running","hint": ...}.
     """
-    job_id = _submit(pr_url)
+    job_id = _submit(pr_url, post=post_comments)
     resp = _wait_for_job(job_id, wait_secs, label=pr_url)
     return resp if resp is not None else _running_response(job_id, wait_secs)
 

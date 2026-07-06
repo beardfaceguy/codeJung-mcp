@@ -65,10 +65,13 @@ def _api(method: str, path: str, body: dict | None = None) -> dict:
         raise RuntimeError(f"codeJung API {method} {path} -> {exc.code}: {detail}") from None
 
 
-def _submit(pr_url: str) -> str:
+def _submit(pr_url: str, post: bool = True) -> str:
     if not _PR_URL_RE.match(pr_url):
         raise ValueError(f"invalid GitHub PR URL: {pr_url!r}")
-    return _api("POST", "/v1/jobs", {"source": {"type": "github_pr", "prUrl": pr_url}})["jobId"]
+    payload: dict = {"source": {"type": "github_pr", "prUrl": pr_url}}
+    if not post:
+        payload["reviewConfig"] = {"post": False}
+    return _api("POST", "/v1/jobs", payload)["jobId"]
 
 
 def _poll(job_id: str) -> dict:
@@ -87,12 +90,14 @@ mcp = FastMCP("codejung", host=HOST, port=PORT)
 
 
 @mcp.tool()
-def submit_review(pr_url: str) -> dict:
+def submit_review(pr_url: str, post_comments: bool = True) -> dict:
     """Submit a GitHub PR for codeJung review and return immediately.
 
+    post_comments=False reviews without posting inline comments to the PR —
+    findings come back via get_review only. Default True.
     Returns {"jobId": "cj_...", "status": "queued"} — poll with get_review.
     """
-    return {"jobId": _submit(pr_url), "status": "queued"}
+    return {"jobId": _submit(pr_url, post=post_comments), "status": "queued"}
 
 
 @mcp.tool()
@@ -108,14 +113,16 @@ def get_review(job_id: str) -> dict:
 
 
 @mcp.tool()
-def review_pr(pr_url: str, wait_secs: int = 240) -> dict:
+def review_pr(pr_url: str, wait_secs: int = 240, post_comments: bool = True) -> dict:
     """Submit a GitHub PR and wait up to wait_secs for the review to finish.
 
     If it completes in that window, returns the review markdown + findings; if
     not, returns status "running" with a jobId to poll via get_review. Never
     blocks indefinitely. Set wait_secs=0 to return right after submit.
+    post_comments=False reviews without posting inline comments to the PR —
+    findings come back here only. Default True.
     """
-    job_id = _submit(pr_url)
+    job_id = _submit(pr_url, post=post_comments)
     start = time.monotonic()
     while True:
         job = _poll(job_id)
