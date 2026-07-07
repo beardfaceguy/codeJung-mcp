@@ -93,6 +93,9 @@ mcp = FastMCP("codejung", host=HOST, port=PORT)
 def submit_review(pr_url: str, post_comments: bool = True) -> dict:
     """Submit a GitHub PR for codeJung review and return immediately.
 
+    The review runs a multi-model pipeline that typically takes ~3-5 minutes
+    (sometimes longer). Tell the user it's running and will take a few minutes,
+    then poll get_review.
     post_comments=False reviews without posting inline comments to the PR —
     findings come back via get_review only. Default True.
     Returns {"jobId": "cj_...", "status": "queued"} — poll with get_review.
@@ -102,7 +105,11 @@ def submit_review(pr_url: str, post_comments: bool = True) -> dict:
 
 @mcp.tool()
 def get_review(job_id: str) -> dict:
-    """Get a review job's status, plus its result once it has succeeded."""
+    """Get a review job's status, plus its result once it has succeeded.
+
+    A "running" status is normal — reviews take ~3-5 minutes. Tell the user it's
+    still in progress and check again in a minute or two.
+    """
     status = _poll(job_id).get("status", "unknown")
     resp = {"jobId": job_id, "status": status}
     if status == "succeeded":
@@ -116,9 +123,11 @@ def get_review(job_id: str) -> dict:
 def review_pr(pr_url: str, wait_secs: int = 240, post_comments: bool = True) -> dict:
     """Submit a GitHub PR and wait up to wait_secs for the review to finish.
 
-    If it completes in that window, returns the review markdown + findings; if
-    not, returns status "running" with a jobId to poll via get_review. Never
-    blocks indefinitely. Set wait_secs=0 to return right after submit.
+    TIMING: a review typically takes ~3-5 minutes (sometimes longer). Tell the
+    user a review is running and to expect a few minutes — a long wait is normal,
+    not a hang. If it returns status "running", that's expected: poll get_review.
+    If it completes in that window, returns the review markdown + findings.
+    Never blocks indefinitely. Set wait_secs=0 to return right after submit.
     post_comments=False reviews without posting inline comments to the PR —
     findings come back here only. Default True.
     """
@@ -138,7 +147,9 @@ def review_pr(pr_url: str, wait_secs: int = 240, post_comments: bool = True) -> 
             return resp
         if time.monotonic() - start >= wait_secs:
             return {"jobId": job_id, "status": "running",
-                    "hint": f"still running; call get_review('{job_id}') to fetch the result"}
+                    "hint": (f"still running after {wait_secs}s — normal, not a hang; reviews "
+                             f"take ~3-5 min. Tell the user it's in progress, then call "
+                             f"get_review('{job_id}') again shortly.")}
         time.sleep(15)
 
 

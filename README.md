@@ -32,6 +32,14 @@ Grok, …). MCP tools run in the client's **Agent mode**.
 findings come back to you (`findings` array + `summaryMarkdown`) and the PR is
 left untouched. Good for "review-then-decide" agent workflows.
 
+### Expect a few minutes
+
+A review runs a multi-model pipeline and typically takes **~3–5 minutes**
+(sometimes longer under load). That's normal, not a hang. Tell the user a review
+is in progress; a `"running"` status just means "check back shortly." Model
+calls are individually deadline-capped and retried, so a review can't hang
+indefinitely — it just isn't instant.
+
 ### Blocking vs non-blocking
 
 `review_pr` / `review_dir` wait *at most* `wait_secs`, emitting progress to

@@ -223,13 +223,19 @@ def _wait_for_job(job_id: str, wait_secs: int, *, label: str = "") -> dict | Non
 
 def _running_response(job_id: str, wait_secs: int) -> dict:
     return {"jobId": job_id, "status": "running",
-            "hint": (f"still running after {wait_secs}s; "
-                     f"call get_review('{job_id}') to fetch the result when done")}
+            "hint": (f"still running after {wait_secs}s — this is normal, not a hang. "
+                     f"codeJung reviews usually take ~3-5 minutes (sometimes longer under "
+                     f"load). Let the user know it's still in progress, then call "
+                     f"get_review('{job_id}') again in a minute or two.")}
 
 
 @mcp.tool()
 def submit_review(pr_url: str, post_comments: bool = True) -> dict:
     """Submit a GitHub PR for codeJung review and return immediately.
+
+    Returns right away with a jobId. The review itself runs a multi-model
+    pipeline that typically takes ~3-5 minutes (sometimes longer). Tell the user
+    the review is running and will take a few minutes, then poll get_review.
 
     Args:
         pr_url: Full GitHub PR URL, e.g. https://github.com/owner/repo/pull/123
@@ -244,6 +250,9 @@ def submit_review(pr_url: str, post_comments: bool = True) -> dict:
 @mcp.tool()
 def get_review(job_id: str) -> dict:
     """Get the status of a review job, plus its result if it has finished.
+
+    A `"running"` status is normal — reviews take ~3-5 minutes. If you get it,
+    tell the user it's still in progress and check again in a minute or two.
 
     Args:
         job_id: The jobId returned by submit_review / review_pr.
@@ -263,6 +272,12 @@ def get_review(job_id: str) -> dict:
 @mcp.tool()
 def review_pr(pr_url: str, wait_secs: int = 300, post_comments: bool = True) -> dict:
     """Submit a GitHub PR for review and wait a bounded time for the result.
+
+    NOTE ON TIMING: a review runs a multi-model pipeline and typically takes
+    ~3-5 minutes (sometimes longer under load). Before/when calling this, tell
+    the user a review is running and to expect a few minutes — a long wait is
+    normal, not a hang. If it returns status "running", that's expected: poll
+    get_review with the jobId.
 
     Submits the job, then waits up to wait_secs (emitting progress to stderr).
     If the review finishes in that window, returns the markdown + findings. If
