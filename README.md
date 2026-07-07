@@ -50,8 +50,11 @@ with short tool-call timeouts, prefer `submit_review` → `get_review`.
 
 ## Installation
 
-Pick **one** of the two options below. You'll need the codeJung **bearer token**
-either way — ask the maintainer (it's the `CODEJUNG_SERVICE_API_TOKEN`).
+Pick **one** of the two options below. You'll need a codeJung **API token**
+either way. Tokens are **issued per user by the maintainer** — you can't
+self-provision one, so **contact the maintainer to request your own key**. Use
+the token they give you wherever `<TOKEN>` appears below; keep it to yourself
+(don't share or paste it in public channels).
 
 ### Option A — Remote URL (recommended; nothing to install)
 
