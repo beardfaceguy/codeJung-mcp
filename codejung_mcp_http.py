@@ -26,7 +26,8 @@ import time
 import urllib.error
 import urllib.request
 
-from mcp.server.fastmcp import FastMCP
+import anyio
+from mcp.server.fastmcp import Context, FastMCP
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
@@ -36,6 +37,7 @@ PORT = int(os.environ.get("CODEJUNG_MCP_HTTP_PORT", "8765"))
 
 _PR_URL_RE = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/pull/\d+$")
 _JOB_ID_RE = re.compile(r"^cj_[0-9a-f]+$")
+_POLL_INTERVAL = 15  # seconds between job polls (module-level so tests can shrink it)
 
 
 def _load_token() -> str:
@@ -130,38 +132,61 @@ def get_review(job_id: str) -> dict:
     return resp
 
 
-@mcp.tool()
-def review_pr(pr_url: str, wait_secs: int = 240, post_comments: bool = True) -> dict:
-    """Submit a GitHub PR and wait up to wait_secs for the review to finish.
+async def _await_job(ctx: Context, job_id: str, wait_secs: int, label: str) -> dict | None:
+    """Poll a job to completion, emitting an MCP progress notification each cycle
+    so the client sees a heartbeat and does not time out mid-review. Returns the
+    terminal response, or None if wait_secs elapses while it is still running.
 
-    TIMING: a review typically takes ~3-5 minutes (sometimes longer). Tell the
-    user a review is running and to expect a few minutes — a long wait is normal,
-    not a hang. If it returns status "running", that's expected: poll get_review.
-    If it completes in that window, returns the review markdown + findings.
-    Never blocks indefinitely. Set wait_secs=0 to return right after submit.
-    post_comments=False reviews without posting inline comments to the PR —
-    findings come back here only. Default True.
+    report_progress no-ops unless the client sent a progressToken, so this is
+    safe for clients that don't support progress. Blocking API calls run in a
+    worker thread so the event loop stays free to flush notifications.
     """
-    job_id = _submit(pr_url, post=post_comments)
     start = time.monotonic()
+    polls = 0
     while True:
-        job = _poll(job_id)
+        job = await anyio.to_thread.run_sync(_poll, job_id)
         status = job.get("status", "unknown")
+        polls += 1
+        elapsed = int(time.monotonic() - start)
+        await ctx.report_progress(
+            min(elapsed, wait_secs), wait_secs,
+            f"{label}: {status} ({elapsed}s elapsed, poll {polls})")
         if status in ("succeeded", "failed", "timed_out"):
             resp = {"jobId": job_id, "status": status}
             if status == "succeeded":
-                r = _result(job_id)
+                r = await anyio.to_thread.run_sync(_result, job_id)
                 resp["summaryMarkdown"] = r.get("summaryMarkdown", "")
                 resp["findings"] = r.get("findings", [])
             else:
                 resp["error"] = job.get("error")
             return resp
         if time.monotonic() - start >= wait_secs:
-            return {"jobId": job_id, "status": "running",
-                    "hint": (f"still running after {wait_secs}s — normal, not a hang; reviews "
-                             f"take ~3-5 min. Tell the user it's in progress, then call "
-                             f"get_review('{job_id}') again shortly.")}
-        time.sleep(15)
+            return None
+        await anyio.sleep(_POLL_INTERVAL)
+
+
+@mcp.tool()
+async def review_pr(pr_url: str, ctx: Context, wait_secs: int = 240,
+                    post_comments: bool = True) -> dict:
+    """Submit a GitHub PR and wait up to wait_secs for the review to finish.
+
+    TIMING: a review typically takes ~3-5 minutes (sometimes longer). While it
+    waits, this streams an MCP progress notification every ~15s (a heartbeat), so
+    progress-aware clients won't time out mid-review. Still, if it returns status
+    "running", that's expected: poll get_review with the jobId.
+    If it completes in that window, returns the review markdown + findings.
+    Never blocks indefinitely. Set wait_secs=0 to return right after submit.
+    post_comments=False reviews without posting inline comments to the PR —
+    findings come back here only. Default True.
+    """
+    job_id = await anyio.to_thread.run_sync(lambda: _submit(pr_url, post=post_comments))
+    resp = await _await_job(ctx, job_id, wait_secs, pr_url)
+    if resp is not None:
+        return resp
+    return {"jobId": job_id, "status": "running",
+            "hint": (f"still running after {wait_secs}s — normal, not a hang; reviews "
+                     f"take ~3-5 min. Tell the user it's in progress, then call "
+                     f"get_review('{job_id}') again shortly.")}
 
 
 @mcp.tool()

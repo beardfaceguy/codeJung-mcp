@@ -30,7 +30,8 @@ import urllib.error
 import urllib.request
 import uuid
 
-from mcp.server.fastmcp import FastMCP
+import anyio
+from mcp.server.fastmcp import Context, FastMCP
 
 # Remote mode: when CODEJUNG_API_URL is set, talk to the public REST API over
 # HTTPS with CODEJUNG_API_TOKEN. When unset, fall back to SSH-to-loopback below.
@@ -46,6 +47,7 @@ ENV_PATH = os.environ.get("CODEJUNG_ENV_PATH", "~/codeJung/deploy/codejung.env")
 # it. Must match the bind mount in deploy/docker-compose.yml.
 STAGING_HOST_DIR = os.environ.get("CODEJUNG_REVIEW_STAGING", "~/cj-review-staging")
 STAGING_CONTAINER_DIR = "/review-staging"
+_POLL_INTERVAL = 15  # seconds between job polls (module-level so tests can shrink it)
 
 # Strict input validation: these values are interpolated into a remote shell
 # command, so they must not contain shell metacharacters. The regexes below
@@ -200,25 +202,33 @@ def _terminal_response(job_id: str, status: str, job: dict) -> dict:
     return resp
 
 
-def _wait_for_job(job_id: str, wait_secs: int, *, label: str = "") -> dict | None:
-    """Poll a job for up to wait_secs, emitting progress to stderr each cycle so
-    the caller can see it is alive (never a silent multi-minute hang). Returns
-    the terminal response once the job finishes, or None if wait_secs elapses
-    while the job is still running (caller then hands back a resumable jobId)."""
+async def _await_job(ctx: Context, job_id: str, wait_secs: int, *, label: str = "") -> dict | None:
+    """Poll a job for up to wait_secs, emitting an MCP progress notification (and
+    a stderr line) each cycle so the client sees a heartbeat and does not time
+    out mid-review. Returns the terminal response once the job finishes, or None
+    if wait_secs elapses while the job is still running (caller then hands back a
+    resumable jobId).
+
+    report_progress no-ops unless the client sent a progressToken, so this is
+    safe for clients that don't support progress. Blocking API calls run in a
+    worker thread so the event loop stays free to flush notifications."""
     start = time.monotonic()
     polls = 0
     while True:
-        job = _poll(job_id)
+        job = await anyio.to_thread.run_sync(_poll, job_id)
         status = job.get("status", "unknown")
         polls += 1
-        print(f"[codejung] {label or job_id}: {status} "
-              f"({int(time.monotonic() - start)}s, poll {polls})",
+        elapsed = int(time.monotonic() - start)
+        print(f"[codejung] {label or job_id}: {status} ({elapsed}s, poll {polls})",
               file=sys.stderr, flush=True)
+        await ctx.report_progress(
+            min(elapsed, wait_secs), wait_secs,
+            f"{label or job_id}: {status} ({elapsed}s elapsed, poll {polls})")
         if status in ("succeeded", "failed", "timed_out"):
-            return _terminal_response(job_id, status, job)
+            return await anyio.to_thread.run_sync(_terminal_response, job_id, status, job)
         if time.monotonic() - start >= wait_secs:
             return None
-        time.sleep(15)
+        await anyio.sleep(_POLL_INTERVAL)
 
 
 def _running_response(job_id: str, wait_secs: int) -> dict:
@@ -270,22 +280,22 @@ def get_review(job_id: str) -> dict:
 
 
 @mcp.tool()
-def review_pr(pr_url: str, wait_secs: int = 300, post_comments: bool = True) -> dict:
+async def review_pr(pr_url: str, ctx: Context, wait_secs: int = 300,
+                    post_comments: bool = True) -> dict:
     """Submit a GitHub PR for review and wait a bounded time for the result.
 
     NOTE ON TIMING: a review runs a multi-model pipeline and typically takes
-    ~3-5 minutes (sometimes longer under load). Before/when calling this, tell
-    the user a review is running and to expect a few minutes — a long wait is
-    normal, not a hang. If it returns status "running", that's expected: poll
-    get_review with the jobId.
+    ~3-5 minutes (sometimes longer under load). While it waits, this streams an
+    MCP progress notification every ~15s (a heartbeat), so progress-aware clients
+    won't time out mid-review. Still, if it returns status "running", that's
+    expected: poll get_review with the jobId.
 
-    Submits the job, then waits up to wait_secs (emitting progress to stderr).
-    If the review finishes in that window, returns the markdown + findings. If
-    not, returns immediately with status "running" and a jobId to poll via
-    get_review — it never blocks indefinitely. Set wait_secs=0 to return as soon
-    as the job is submitted (equivalent to submit_review). For guaranteed
-    non-blocking use in clients with short tool-call timeouts, prefer
-    submit_review + get_review.
+    Submits the job, then waits up to wait_secs. If the review finishes in that
+    window, returns the markdown + findings. If not, returns immediately with
+    status "running" and a jobId to poll via get_review — it never blocks
+    indefinitely. Set wait_secs=0 to return as soon as the job is submitted
+    (equivalent to submit_review). For guaranteed non-blocking use in clients
+    with short tool-call timeouts, prefer submit_review + get_review.
 
     Args:
         pr_url: Full GitHub PR URL, e.g. https://github.com/owner/repo/pull/123
@@ -297,20 +307,22 @@ def review_pr(pr_url: str, wait_secs: int = 300, post_comments: bool = True) -> 
         failed/timed_out → {"jobId","status","error"};
         still running → {"jobId","status":"running","hint": ...}.
     """
-    job_id = _submit(pr_url, post=post_comments)
-    resp = _wait_for_job(job_id, wait_secs, label=pr_url)
+    job_id = await anyio.to_thread.run_sync(lambda: _submit(pr_url, post=post_comments))
+    resp = await _await_job(ctx, job_id, wait_secs, label=pr_url)
     return resp if resp is not None else _running_response(job_id, wait_secs)
 
 
 @mcp.tool()
-def review_dir(path: str, wait_secs: int = 300) -> dict:
+async def review_dir(path: str, ctx: Context, wait_secs: int = 300) -> dict:
     """Review a local directory of code with codeJung (full-file scan, no PR needed).
 
     Stages the directory to the codeJung host, runs a full-file review of every
-    source file in it, and waits up to wait_secs (emitting progress to stderr).
-    If the review finishes in that window, returns the markdown + findings; if
-    not, returns status "running" with a jobId to poll via get_review — it never
-    blocks indefinitely. Use this for code that is not (yet) a GitHub PR.
+    source file in it, and waits up to wait_secs. While it waits, this streams an
+    MCP progress notification every ~15s (a heartbeat), so progress-aware clients
+    won't time out mid-review. If the review finishes in that window, returns the
+    markdown + findings; if not, returns status "running" with a jobId to poll
+    via get_review — it never blocks indefinitely. Use this for code that is not
+    (yet) a GitHub PR.
 
     Args:
         path: Local directory path on this machine to review.
@@ -325,14 +337,14 @@ def review_dir(path: str, wait_secs: int = 300) -> dict:
                 "error": ("review_dir rsyncs the directory to the host and needs SSH mode; "
                           "it is not available against a remote CODEJUNG_API_URL. "
                           "Use review_pr for remote reviews.")}
-    _sweep_stale_staging()  # reap staging dirs orphaned by earlier timed-out jobs
-    container_path, host_sub = _stage_dir(path)
+    await anyio.to_thread.run_sync(_sweep_stale_staging)  # reap dirs orphaned by timed-out jobs
+    container_path, host_sub = await anyio.to_thread.run_sync(_stage_dir, path)
 
     # Submit first, in its own guard, so job_id is unambiguously bound.
     try:
-        job_id = _submit_local_dir(container_path)
+        job_id = await anyio.to_thread.run_sync(_submit_local_dir, container_path)
     except Exception:
-        _unstage(host_sub)
+        await anyio.to_thread.run_sync(_unstage, host_sub)
         raise
 
     # Cleanup is deliberately NOT in a `finally`: the worker reads the staged
@@ -340,13 +352,13 @@ def review_dir(path: str, wait_secs: int = 300) -> dict:
     # (the wait-elapsed path) would pull the rug out from under it. We unstage
     # only once the job is terminal, or on an error path.
     try:
-        resp = _wait_for_job(job_id, wait_secs, label=path)
+        resp = await _await_job(ctx, job_id, wait_secs, label=path)
     except Exception:
-        _unstage(host_sub)
+        await anyio.to_thread.run_sync(_unstage, host_sub)
         raise
 
     if resp is not None:
-        _unstage(host_sub)  # job is terminal — staged files no longer needed
+        await anyio.to_thread.run_sync(_unstage, host_sub)  # terminal — staged files no longer needed
         return resp
     # Still running: leave the staged files in place so the job (and a later
     # get_review) can complete. The copy is reaped by _sweep_stale_staging().
