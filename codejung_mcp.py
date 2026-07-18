@@ -219,11 +219,13 @@ async def _await_job(ctx: Context, job_id: str, wait_secs: int, *, label: str = 
         status = job.get("status", "unknown")
         polls += 1
         elapsed = int(time.monotonic() - start)
-        print(f"[codejung] {label or job_id}: {status} ({elapsed}s, poll {polls})",
+        phase = job.get("phase")
+        detail = f" · {phase}" if phase else ""
+        print(f"[codejung] {label or job_id}: {status}{detail} ({elapsed}s, poll {polls})",
               file=sys.stderr, flush=True)
         await ctx.report_progress(
             min(elapsed, wait_secs), wait_secs,
-            f"{label or job_id}: {status} ({elapsed}s elapsed, poll {polls})")
+            f"{label or job_id}: {status}{detail} ({elapsed}s elapsed, poll {polls})")
         if status in ("succeeded", "failed", "timed_out"):
             return await anyio.to_thread.run_sync(_terminal_response, job_id, status, job)
         if time.monotonic() - start >= wait_secs:
@@ -270,8 +272,11 @@ def get_review(job_id: str) -> dict:
         {"status": ..., "summaryMarkdown": ..., "findings": [...]} — the last
         two are present only once status is "succeeded".
     """
-    status = _poll(job_id).get("status", "unknown")
+    job = _poll(job_id)
+    status = job.get("status", "unknown")
     resp = {"jobId": job_id, "status": status}
+    if job.get("phase"):
+        resp["phase"] = job["phase"]  # current pipeline step, e.g. "pass2", "reconcile"
     if status == "succeeded":
         r = _result(job_id)
         resp["summaryMarkdown"] = r.get("summaryMarkdown", "")

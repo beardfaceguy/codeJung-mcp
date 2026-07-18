@@ -85,6 +85,25 @@ def test_http_review_pr_failed_carries_error(monkeypatch):
     assert resp["error"] == {"code": "boom"}
 
 
+def test_http_get_review_surfaces_phase(monkeypatch):
+    monkeypatch.setattr(http, "_poll", lambda job_id: {"status": "running", "phase": "reconcile"})
+    resp = http.get_review("cj_x")
+    assert resp["status"] == "running"
+    assert resp["phase"] == "reconcile"
+
+
+def test_http_heartbeat_message_includes_phase(monkeypatch):
+    seq = iter([{"status": "running", "phase": "pass1"},
+                {"status": "succeeded", "phase": "posting"}])
+    monkeypatch.setattr(http, "_submit", lambda pr_url, post=True: "cj_p")
+    monkeypatch.setattr(http, "_poll", lambda job_id: next(seq))
+    monkeypatch.setattr(http, "_result", lambda job_id: {"summaryMarkdown": "", "findings": []})
+    ctx = FakeCtx()
+    asyncio.run(http.review_pr("https://github.com/o/r/pull/1", ctx, wait_secs=100))
+    messages = [c[2] for c in ctx.calls]
+    assert any("pass1" in m for m in messages)
+
+
 # ---- stdio server --------------------------------------------------------
 
 def test_stdio_review_pr_emits_progress_then_succeeds(monkeypatch):
@@ -98,6 +117,13 @@ def test_stdio_review_pr_emits_progress_then_succeeds(monkeypatch):
     assert resp["status"] == "succeeded"
     assert resp["findings"] == [{"id": 2}]
     assert len(ctx.calls) == 2  # 1 running + 1 terminal
+
+
+def test_stdio_get_review_surfaces_phase(monkeypatch):
+    monkeypatch.setattr(stdio, "_poll", lambda job_id: {"status": "running", "phase": "pass3"})
+    resp = stdio.get_review("cj_y")
+    assert resp["status"] == "running"
+    assert resp["phase"] == "pass3"
 
 
 def test_stdio_review_dir_stages_waits_and_unstages(monkeypatch):

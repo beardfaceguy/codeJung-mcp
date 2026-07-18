@@ -123,8 +123,11 @@ def get_review(job_id: str) -> dict:
     A "running" status is normal — reviews take ~3-5 minutes. Tell the user it's
     still in progress and check again in a minute or two.
     """
-    status = _poll(job_id).get("status", "unknown")
+    job = _poll(job_id)
+    status = job.get("status", "unknown")
     resp = {"jobId": job_id, "status": status}
+    if job.get("phase"):
+        resp["phase"] = job["phase"]  # current pipeline step, e.g. "pass2", "reconcile"
     if status == "succeeded":
         r = _result(job_id)
         resp["summaryMarkdown"] = r.get("summaryMarkdown", "")
@@ -148,9 +151,11 @@ async def _await_job(ctx: Context, job_id: str, wait_secs: int, label: str) -> d
         status = job.get("status", "unknown")
         polls += 1
         elapsed = int(time.monotonic() - start)
+        phase = job.get("phase")
+        detail = f" · {phase}" if phase else ""
         await ctx.report_progress(
             min(elapsed, wait_secs), wait_secs,
-            f"{label}: {status} ({elapsed}s elapsed, poll {polls})")
+            f"{label}: {status}{detail} ({elapsed}s elapsed, poll {polls})")
         if status in ("succeeded", "failed", "timed_out"):
             resp = {"jobId": job_id, "status": status}
             if status == "succeeded":
