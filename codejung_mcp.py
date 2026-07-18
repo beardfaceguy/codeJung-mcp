@@ -254,7 +254,8 @@ def submit_review(pr_url: str, post_comments: bool = True) -> dict:
         post_comments: If False, the review does NOT post inline comments to the
             PR — findings are only returned to you (via get_review). Default True.
     Returns:
-        {"jobId": "cj_...", "status": "queued"} — poll with get_review.
+        {"jobId": "cj_...", "status": "queued"} — poll with get_review, which
+        reports a live `phase` (current pipeline step) while the review runs.
     """
     return {"jobId": _submit(pr_url, post=post_comments), "status": "queued"}
 
@@ -266,11 +267,15 @@ def get_review(job_id: str) -> dict:
     A `"running"` status is normal — reviews take ~3-5 minutes. If you get it,
     tell the user it's still in progress and check again in a minute or two.
 
+    While running, the response carries a `phase` field naming the current
+    pipeline step (e.g. "chunking", "pass2", "reconcile", "posting") — surface it
+    so the user sees which step the review is on.
+
     Args:
         job_id: The jobId returned by submit_review / review_pr.
     Returns:
-        {"status": ..., "summaryMarkdown": ..., "findings": [...]} — the last
-        two are present only once status is "succeeded".
+        {"status": ..., "phase": ..., "summaryMarkdown": ..., "findings": [...]} —
+        `phase` is present while running; the last two only once "succeeded".
     """
     job = _poll(job_id)
     status = job.get("status", "unknown")
@@ -291,9 +296,11 @@ async def review_pr(pr_url: str, ctx: Context, wait_secs: int = 300,
 
     NOTE ON TIMING: a review runs a multi-model pipeline and typically takes
     ~3-5 minutes (sometimes longer under load). While it waits, this streams an
-    MCP progress notification every ~15s (a heartbeat), so progress-aware clients
-    won't time out mid-review. Still, if it returns status "running", that's
-    expected: poll get_review with the jobId.
+    MCP progress notification every ~15s (a heartbeat) naming the current
+    pipeline step (e.g. "running · reconcile"), so progress-aware clients won't
+    time out mid-review. Still, if it returns status "running", that's expected:
+    poll get_review with the jobId — its response carries the same `phase` field
+    for clients that don't consume progress.
 
     Submits the job, then waits up to wait_secs. If the review finishes in that
     window, returns the markdown + findings. If not, returns immediately with
@@ -323,11 +330,12 @@ async def review_dir(path: str, ctx: Context, wait_secs: int = 300) -> dict:
 
     Stages the directory to the codeJung host, runs a full-file review of every
     source file in it, and waits up to wait_secs. While it waits, this streams an
-    MCP progress notification every ~15s (a heartbeat), so progress-aware clients
-    won't time out mid-review. If the review finishes in that window, returns the
+    MCP progress notification every ~15s (a heartbeat) naming the current
+    pipeline step (e.g. "running · reconcile"), so progress-aware clients won't
+    time out mid-review. If the review finishes in that window, returns the
     markdown + findings; if not, returns status "running" with a jobId to poll
-    via get_review — it never blocks indefinitely. Use this for code that is not
-    (yet) a GitHub PR.
+    via get_review (whose response carries the same `phase` field) — it never
+    blocks indefinitely. Use this for code that is not (yet) a GitHub PR.
 
     Args:
         path: Local directory path on this machine to review.

@@ -111,7 +111,8 @@ def submit_review(pr_url: str, post_comments: bool = True) -> dict:
     then poll get_review.
     post_comments=False reviews without posting inline comments to the PR —
     findings come back via get_review only. Default True.
-    Returns {"jobId": "cj_...", "status": "queued"} — poll with get_review.
+    Returns {"jobId": "cj_...", "status": "queued"} — poll with get_review, which
+    reports a live `phase` (current pipeline step) while the review runs.
     """
     return {"jobId": _submit(pr_url, post=post_comments), "status": "queued"}
 
@@ -122,6 +123,11 @@ def get_review(job_id: str) -> dict:
 
     A "running" status is normal — reviews take ~3-5 minutes. Tell the user it's
     still in progress and check again in a minute or two.
+
+    While running, the response carries a `phase` field naming the current
+    pipeline step (e.g. "chunking", "pass2", "reconcile", "posting") — surface it
+    so the user sees which step the review is on. Once "succeeded", the response
+    adds `summaryMarkdown` + `findings`.
     """
     job = _poll(job_id)
     status = job.get("status", "unknown")
@@ -176,9 +182,11 @@ async def review_pr(pr_url: str, ctx: Context, wait_secs: int = 240,
     """Submit a GitHub PR and wait up to wait_secs for the review to finish.
 
     TIMING: a review typically takes ~3-5 minutes (sometimes longer). While it
-    waits, this streams an MCP progress notification every ~15s (a heartbeat), so
+    waits, this streams an MCP progress notification every ~15s (a heartbeat)
+    naming the current pipeline step (e.g. "running · reconcile"), so
     progress-aware clients won't time out mid-review. Still, if it returns status
-    "running", that's expected: poll get_review with the jobId.
+    "running", that's expected: poll get_review with the jobId — its response
+    carries the same `phase` field for clients that don't consume progress.
     If it completes in that window, returns the review markdown + findings.
     Never blocks indefinitely. Set wait_secs=0 to return right after submit.
     post_comments=False reviews without posting inline comments to the PR —
