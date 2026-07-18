@@ -27,6 +27,8 @@ import urllib.error
 import urllib.request
 
 from mcp.server.fastmcp import FastMCP
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 API = os.environ.get("CODEJUNG_API", "http://127.0.0.1:8080")
 HOST = os.environ.get("CODEJUNG_MCP_HTTP_HOST", "127.0.0.1")
@@ -63,6 +65,15 @@ def _api(method: str, path: str, body: dict | None = None) -> dict:
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:300]
         raise RuntimeError(f"codeJung API {method} {path} -> {exc.code}: {detail}") from None
+
+
+def _backend_health() -> dict:
+    """Probe the codeJung REST API's unauthenticated readiness endpoint."""
+    try:
+        with urllib.request.urlopen(API + "/v1/health", timeout=5) as resp:
+            return json.loads(resp.read().decode())
+    except Exception as exc:  # network error, non-200, bad JSON — all "not ready"
+        return {"status": "unreachable", "error": str(exc)[:200]}
 
 
 def _submit(pr_url: str, post: bool = True) -> str:
@@ -151,6 +162,33 @@ def review_pr(pr_url: str, wait_secs: int = 240, post_comments: bool = True) -> 
                              f"take ~3-5 min. Tell the user it's in progress, then call "
                              f"get_review('{job_id}') again shortly.")}
         time.sleep(15)
+
+
+@mcp.tool()
+def health() -> dict:
+    """Check that codeJung is up and ready to accept reviews.
+
+    Use this to verify the service before submitting a review. Returns
+    {"mcp": "ok", "backend": {...}} — "backend" is the REST API's own health
+    (status "ok" when ready, "unreachable" when the API is down).
+    """
+    return {"mcp": "ok", "backend": _backend_health()}
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(_request: Request) -> JSONResponse:
+    """Unauthenticated liveness/readiness probe for the MCP process itself.
+
+    A 200 here means this MCP process is serving. "backend" reports the REST
+    API's readiness; the status code goes 503 when the backend is not ready so
+    an uptime monitor / reverse proxy can see a degraded state.
+    """
+    backend = _backend_health()
+    ready = backend.get("status") == "ok"
+    return JSONResponse(
+        {"status": "ok" if ready else "degraded", "mcp": "ok", "backend": backend},
+        status_code=200 if ready else 503,
+    )
 
 
 if __name__ == "__main__":

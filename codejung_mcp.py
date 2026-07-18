@@ -353,5 +353,21 @@ def review_dir(path: str, wait_secs: int = 300) -> dict:
     return _running_response(job_id, wait_secs)
 
 
+@mcp.tool()
+def health() -> dict:
+    """Check that codeJung is reachable and ready to accept reviews.
+
+    Exercises the same path the review tools use (remote HTTPS or SSH-to-loopback)
+    and hits the service's readiness endpoint. Use it to confirm connectivity
+    before submitting a review.
+    Returns {"status": "ok", "backend": {...}} on success, or
+    {"status": "error", "error": ...} if the service is unreachable.
+    """
+    try:
+        return {"status": "ok", "backend": _api("GET", "/v1/health")}
+    except Exception as exc:
+        return {"status": "error", "error": str(exc)[:300]}
+
+
 if __name__ == "__main__":
     mcp.run()
