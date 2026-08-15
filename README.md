@@ -20,6 +20,7 @@ to connect** (see [Installation](#installation)):
 | `submit_review(pr_url, post_comments=True)` | Submit a PR and return `jobId` immediately (for long reviews). |
 | `get_review(job_id)` | Status, plus result once the job has succeeded. |
 | `review_dir(path, wait_secs=300)` | Review a **local directory** (full-file scan, no PR needed). *Local stdio + SSH mode only.* |
+| `report_incorrect_finding(finding_id, explanation, category="false_positive")` | Send an incorrect finding to codeJung's pending feedback dataset. |
 
 The selected LLM in your client is irrelevant — the client (not the model)
 drives the server, so it works with any tool-calling model (GPT, Claude, Gemini,
@@ -31,6 +32,24 @@ Grok, …). MCP tools run in the client's **Agent mode**.
 `post_comments=False` to review a PR **without posting inline comments** — the
 findings come back to you (`findings` array + `summaryMarkdown`) and the PR is
 left untouched. Good for "review-then-decide" agent workflows.
+
+### Report an incorrect finding
+
+Every codeJung finding carries a `cjf_...` ID. Use
+`report_incorrect_finding` when a finding is wrong:
+
+```text
+report_incorrect_finding(
+  finding_id="cjf_deadbeef",
+  explanation="The preceding guard already rejects this case.",
+  category="false_positive"
+)
+```
+
+Categories: `false_positive`, `incorrect_reasoning`, `wrong_severity`, `stale`,
+`duplicate`, `noise`, and `design_choice`. Feedback is stored as `pending` for
+moderation; it is never promoted into training data automatically. Identical
+submissions use the same idempotency key.
 
 ### Expect a few minutes
 
