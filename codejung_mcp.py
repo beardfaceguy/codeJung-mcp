@@ -20,9 +20,11 @@ Config (env vars):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -54,6 +56,11 @@ _POLL_INTERVAL = 15  # seconds between job polls (module-level so tests can shri
 # permit only the exact shapes we expect, rejecting everything else.
 _PR_URL_RE = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/pull/\d+$")
 _JOB_ID_RE = re.compile(r"^cj_[0-9a-f]+$")
+_FINDING_ID_RE = re.compile(r"^cjf_[0-9a-f]{6,64}$")
+_FEEDBACK_CATEGORIES = frozenset(
+    {"false_positive", "incorrect_reasoning", "wrong_severity", "stale",
+     "duplicate", "noise", "design_choice"}
+)
 
 
 def _safe_config_path(value: str, name: str) -> str:
@@ -83,7 +90,12 @@ def _ssh(remote_cmd: str) -> str:
     return proc.stdout
 
 
-def _api(method: str, path: str, body: dict | None = None) -> dict:
+def _api(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    headers: dict[str, str] | None = None,
+) -> dict:
     """Call the codeJung REST API and return the parsed JSON.
 
     Remote mode: HTTPS to CODEJUNG_API_URL with CODEJUNG_API_TOKEN.
@@ -92,10 +104,14 @@ def _api(method: str, path: str, body: dict | None = None) -> dict:
     """
     if REMOTE_URL:
         data = json.dumps(body).encode() if body is not None else None
+        request_headers = {
+            "Authorization": f"Bearer {REMOTE_TOKEN}",
+            "Content-Type": "application/json",
+        }
+        request_headers.update(headers or {})
         req = urllib.request.Request(
             REMOTE_URL + path, data=data, method=method,
-            headers={"Authorization": f"Bearer {REMOTE_TOKEN}",
-                     "Content-Type": "application/json"})
+            headers=request_headers)
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
                 return json.loads(resp.read().decode())
@@ -105,13 +121,47 @@ def _api(method: str, path: str, body: dict | None = None) -> dict:
     # SSH mode. cut -f2- (not -f2): tokens may legitimately contain '=' characters.
     token_expr = f"TOKEN=$(grep ^CODEJUNG_SERVICE_API_TOKEN {ENV_PATH} | cut -d= -f2-)"
     url = f"http://127.0.0.1:8080{path}"
+    extra_headers = " ".join(
+        f"-H {shlex.quote(f'{name}: {value}')}"
+        for name, value in (headers or {}).items()
+    )
     if body is not None:
         curl = (f"curl -s -X {method} {url} "
                 f'-H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" '
-                f"-d '{json.dumps(body)}'")
+                f"{extra_headers} -d {shlex.quote(json.dumps(body))}")
     else:
-        curl = f'curl -s -X {method} {url} -H "Authorization: Bearer $TOKEN"'
+        curl = (
+            f'curl -s -X {method} {url} -H "Authorization: Bearer $TOKEN" '
+            f"{extra_headers}"
+        )
     return json.loads(_ssh(f"{token_expr}; {curl}"))
+
+
+def _feedback_request(
+    finding_id: str,
+    explanation: str,
+    category: str,
+) -> dict:
+    if not _FINDING_ID_RE.fullmatch(finding_id):
+        raise ValueError(f"invalid codeJung finding ID: {finding_id!r}")
+    explanation = explanation.strip()
+    if len(explanation) < 8:
+        raise ValueError("explanation must be at least 8 characters")
+    if category not in _FEEDBACK_CATEGORIES:
+        raise ValueError(f"unsupported feedback category: {category!r}")
+    payload = {"explanation": explanation, "category": category}
+    encoded = json.dumps(
+        {"finding_id": finding_id, **payload},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    idempotency_key = "mcp-" + hashlib.sha256(encoded).hexdigest()
+    return _api(
+        "POST",
+        f"/v1/findings/{finding_id}/feedback",
+        payload,
+        {"Idempotency-Key": idempotency_key},
+    )
 
 
 def _submit(pr_url: str, post: bool = True) -> str:
@@ -392,6 +442,30 @@ def health() -> dict:
         return {"status": "ok", "backend": _api("GET", "/v1/health")}
     except Exception as exc:
         return {"status": "error", "error": str(exc)[:300]}
+
+
+@mcp.tool()
+def report_incorrect_finding(
+    finding_id: str,
+    explanation: str,
+    category: str = "false_positive",
+) -> dict:
+    """Report that a codeJung review finding is incorrect.
+
+    The correction is stored in pending moderation state for a future
+    codeJung-specific training/evaluation dataset. It is never promoted into
+    training data automatically. Repeating the same correction is idempotent.
+
+    Args:
+        finding_id: The `cjf_...` ID returned with a finding or shown in its
+            GitHub comment footer.
+        explanation: Why the finding is incorrect (at least 8 characters).
+        category: One of false_positive, incorrect_reasoning, wrong_severity,
+            stale, duplicate, noise, or design_choice.
+    Returns:
+        {"feedbackId": "cjfdb_...", "findingId": "cjf_...", "state": "pending"}.
+    """
+    return _feedback_request(finding_id, explanation, category)
 
 
 if __name__ == "__main__":

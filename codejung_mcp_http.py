@@ -19,6 +19,7 @@ Config (env vars):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -37,6 +38,11 @@ PORT = int(os.environ.get("CODEJUNG_MCP_HTTP_PORT", "8765"))
 
 _PR_URL_RE = re.compile(r"^https://github\.com/[\w.-]+/[\w.-]+/pull/\d+$")
 _JOB_ID_RE = re.compile(r"^cj_[0-9a-f]+$")
+_FINDING_ID_RE = re.compile(r"^cjf_[0-9a-f]{6,64}$")
+_FEEDBACK_CATEGORIES = frozenset(
+    {"false_positive", "incorrect_reasoning", "wrong_severity", "stale",
+     "duplicate", "noise", "design_choice"}
+)
 _POLL_INTERVAL = 15  # seconds between job polls (module-level so tests can shrink it)
 
 
@@ -56,17 +62,54 @@ def _load_token() -> str:
 TOKEN = _load_token()
 
 
-def _api(method: str, path: str, body: dict | None = None) -> dict:
+def _api(
+    method: str,
+    path: str,
+    body: dict | None = None,
+    headers: dict[str, str] | None = None,
+) -> dict:
     data = json.dumps(body).encode() if body is not None else None
+    request_headers = {
+        "Authorization": f"Bearer {TOKEN}",
+        "Content-Type": "application/json",
+    }
+    request_headers.update(headers or {})
     req = urllib.request.Request(
         API + path, data=data, method=method,
-        headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"})
+        headers=request_headers)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode(errors="replace")[:300]
         raise RuntimeError(f"codeJung API {method} {path} -> {exc.code}: {detail}") from None
+
+
+def _feedback_request(
+    finding_id: str,
+    explanation: str,
+    category: str,
+) -> dict:
+    if not _FINDING_ID_RE.fullmatch(finding_id):
+        raise ValueError(f"invalid codeJung finding ID: {finding_id!r}")
+    explanation = explanation.strip()
+    if len(explanation) < 8:
+        raise ValueError("explanation must be at least 8 characters")
+    if category not in _FEEDBACK_CATEGORIES:
+        raise ValueError(f"unsupported feedback category: {category!r}")
+    payload = {"explanation": explanation, "category": category}
+    encoded = json.dumps(
+        {"finding_id": finding_id, **payload},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    idempotency_key = "mcp-" + hashlib.sha256(encoded).hexdigest()
+    return _api(
+        "POST",
+        f"/v1/findings/{finding_id}/feedback",
+        payload,
+        {"Idempotency-Key": idempotency_key},
+    )
 
 
 def _backend_health() -> dict:
@@ -211,6 +254,30 @@ def health() -> dict:
     (status "ok" when ready, "unreachable" when the API is down).
     """
     return {"mcp": "ok", "backend": _backend_health()}
+
+
+@mcp.tool()
+def report_incorrect_finding(
+    finding_id: str,
+    explanation: str,
+    category: str = "false_positive",
+) -> dict:
+    """Report that a codeJung review finding is incorrect.
+
+    The correction is stored in pending moderation state for a future
+    codeJung-specific training/evaluation dataset. It is never promoted into
+    training data automatically. Repeating the same correction is idempotent.
+
+    Args:
+        finding_id: The `cjf_...` ID returned with a finding or shown in its
+            GitHub comment footer.
+        explanation: Why the finding is incorrect (at least 8 characters).
+        category: One of false_positive, incorrect_reasoning, wrong_severity,
+            stale, duplicate, noise, or design_choice.
+    Returns:
+        {"feedbackId": "cjfdb_...", "findingId": "cjf_...", "state": "pending"}.
+    """
+    return _feedback_request(finding_id, explanation, category)
 
 
 @mcp.custom_route("/healthz", methods=["GET"])
